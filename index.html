@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gra - Kaszanka</title>
+    <script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; background: #222; color: white; font-family: sans-serif; }
+        canvas { display: none; }
+        #ui { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; background: #333; padding: 20px; border-radius: 10px; width: 300px; }
+        input, select, button { margin: 10px 0; padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; }
+        button { background: #55ff55; color: black; border: none; font-weight: bold; cursor: pointer; }
+        button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
+        #status { font-size: 14px; margin-bottom: 10px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <h2>Wprowadź dane</h2>
+    <div id="status" style="color: #ffaa00;">Inicjalizacja skryptów...</div>
+    <input type="text" id="playerName" placeholder="Twoje imię" maxlength="15"><br>
+    <select id="playerShape">
+        <option value="circle">Koło</option>
+        <option value="square">Kwadrat</option>
+        <option value="triangle">Trójkąt</option>
+        <option value="pentagon">Pięciokąt</option>
+        <option value="star">Gwiazda</option>
+    </select><br>
+    <button id="startBtn" disabled>Czekaj na sieć...</button>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const ui = document.getElementById('ui');
+    const canvas = document.getElementById('gameCanvas');
+    const startBtn = document.getElementById('startBtn');
+    const statusDiv = document.getElementById('status');
+    const ctx = canvas.getContext('2d');
+    
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    let myId = Math.random().toString(36).substr(2, 9);
+    let me = { x: canvas.width/2, y: canvas.height/2, vx: 0, vy: 0, name: '', shape: 'circle' };
+    let players = {};
+    let colliding = {};
+    let textTimer = 0;
+    let gameStarted = false;
+    let client = null;
+
+    const speed = 0.6;
+    const friction = 0.92;
+    const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+    const topic = 'kaszanka_game_room_998877';
+
+    if (typeof mqtt !== 'undefined') {
+        statusDiv.innerText = "Łączenie z brokerem MQTT...";
+        
+        // Konfiguracja połączenia z publicznym brokerem EMQX
+        client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+            clientId: 'kaszanka_' + myId,
+            connectTimeout: 4000,
+            reconnectPeriod: 2000
+        });
+
+        client.on('connect', () => {
+            statusDiv.innerText = "Połączono. Serwer aktywny.";
+            statusDiv.style.color = "#55ff55";
+            startBtn.disabled = false;
+            startBtn.innerText = "Graj";
+            client.subscribe(topic);
+        });
+
+        client.on('error', (err) => {
+            statusDiv.innerText = "Błąd sieci: " + err.message;
+            statusDiv.style.color = "#ff5555";
+        });
+
+        client.on('offline', () => {
+            statusDiv.innerText = "Rozłączono (Offline). Próba ponownego połączenia...";
+            statusDiv.style.color = "#ffaa00";
+            startBtn.disabled = true;
+        });
+
+        client.on('message', (t, message) => {
+            try {
+                const data = JSON.parse(message.toString());
+                if (data.id !== myId) {
+                    players[data.id] = data;
+                    players[data.id].lastSeen = Date.now();
+                }
+            } catch (e) {}
+        });
+    } else {
+        statusDiv.innerText = "Błąd: Brak biblioteki MQTT (CDN blocked).";
+        statusDiv.style.color = "#ff5555";
+    }
+
+    startBtn.addEventListener('click', () => {
+        const nameInput = document.getElementById('playerName').value;
+        if (!nameInput || gameStarted || !client || !client.connected) return;
+        
+        gameStarted = true;
+        startBtn.disabled = true;
+        
+        me.name = nameInput;
+        me.shape = document.getElementById('playerShape').value;
+        ui.style.display = 'none';
+        canvas.style.display = 'block';
+        
+        window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (window.audioCtx.state === 'suspended') {
+            window.audioCtx.resume();
+        }
+        
+        requestAnimationFrame(gameLoop);
+        setInterval(broadcastState, 50);
+    });
+
+    window.addEventListener('keydown', e => { if (keys.hasOwnProperty(e.key)) keys[e.key] = true; });
+    window.addEventListener('keyup', e => { if (keys.hasOwnProperty(e.key)) keys[e.key] = false; });
+    window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; });
+
+    function playNoise() {
+        if (!window.audioCtx) return;
+        if (window.audioCtx.state === 'suspended') window.audioCtx.resume();
+        
+        const bufferSize = window.audioCtx.sampleRate * 0.1; 
+        const buffer = window.audioCtx.createBuffer(1, bufferSize, window.audioCtx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+        
+        const noise = window.audioCtx.createBufferSource();
+        noise.buffer = buffer;
+        const gainNode = window.audioCtx.createGain();
+        gainNode.gain.setValueAtTime(0.5, window.audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + 0.1);
+        
+        noise.connect(gainNode);
+        gainNode.connect(window.audioCtx.destination);
+        noise.start();
+    }
+
+    function broadcastState() {
+        if (!gameStarted || !client || !client.connected) return;
+        client.publish(topic, JSON.stringify({
+            id: myId,
+            x: me.x,
+            y: me.y,
+            name: me.name,
+            shape: me.shape,
+            showText: textTimer > 0
+        }));
+    }
+
+    function drawShape(x, y, shape, color) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        const size = 20;
+        if (shape === 'circle') {
+            ctx.arc(x, y, size, 0, Math.PI * 2);
+        } else if (shape === 'square') {
+            ctx.rect(x - size, y - size, size * 2, size * 2);
+        } else if (shape === 'triangle') {
+            ctx.moveTo(x, y - size);
+            ctx.lineTo(x + size, y + size);
+            ctx.lineTo(x - size, y + size);
+        } else if (shape === 'pentagon') {
+            for (let i = 0; i < 5; i++) {
+                ctx.lineTo(x + size * Math.cos(i * 2 * Math.PI / 5 - Math.PI / 2), y + size * Math.sin(i * 2 * Math.PI / 5 - Math.PI / 2));
+            }
+        } else if (shape === 'star') {
+            for (let i = 0; i < 10; i++) {
+                const r = i % 2 === 0 ? size : size / 2;
+                ctx.lineTo(x + r * Math.cos(i * Math.PI / 5 - Math.PI / 2), y + r * Math.sin(i * Math.PI / 5 - Math.PI / 2));
+            }
+        }
+        ctx.closePath();
+        ctx.fill();
+    }
+
+    function gameLoop() {
+        if (keys.ArrowUp) me.vy -= speed;
+        if (keys.ArrowDown) me.vy += speed;
+        if (keys.ArrowLeft) me.vx -= speed;
+        if (keys.ArrowRight) me.vx += speed;
+
+        me.vx *= friction;
+        me.vy *= friction;
+        me.x += me.vx;
+        me.y += me.vy;
+
+        if (me.x < 20) { me.x = 20; me.vx *= -1; }
+        if (me.x > canvas.width - 20) { me.x = canvas.width - 20; me.vx *= -1; }
+        if (me.y < 20) { me.y = 20; me.vy *= -1; }
+        if (me.y > canvas.height - 20) { me.y = canvas.height - 20; me.vy *= -1; }
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        const now = Date.now();
+        for (let id in players) {
+            let p = players[id];
+            if (now - p.lastSeen > 2000) {
+                delete players[id];
+                continue;
+            }
+
+            let dx = p.x - me.x;
+            let dy = p.y - me.y;
+            let dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist < 40 && !colliding[id]) {
+                playNoise();
+                textTimer = 120;
+                colliding[id] = true;
+            } else if (dist >= 40) {
+                colliding[id] = false;
+            }
+
+            drawShape(p.x, p.y, p.shape, '#ff5555');
+            ctx.fillStyle = 'white';
+            ctx.font = '14px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(p.name, p.x, p.y + 35);
+            
+            if (p.showText) {
+                ctx.fillStyle = 'yellow';
+                ctx.font = 'bold 16px sans-serif';
+                ctx.fillText("masz kaszankę?", p.x, p.y - 30);
+            }
+        }
+
+        drawShape(me.x, me.y, me.shape, '#55ff55');
+        ctx.fillStyle = 'white';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(me.name, me.x, me.y + 35);
+
+        if (textTimer > 0) {
+            ctx.fillStyle = 'yellow';
+            ctx.font = 'bold 16px sans-serif';
+            ctx.fillText("masz kaszankę?", me.x, me.y - 30);
+            textTimer--;
+        }
+
+        requestAnimationFrame(gameLoop);
+    }
+</script>
+</body>
+</html>
